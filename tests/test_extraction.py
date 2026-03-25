@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -16,11 +17,13 @@ import pytest
 
 from abb_cvc_extract import (
     detect_mbps_scale,
+    discover_pois,
     downsample,
     extract_graph,
     extract_line,
     find_gridlines_y,
     find_label_centers_x,
+    main,
     pixel_to_mbps,
     pixel_to_timestamp,
     to_line_protocol,
@@ -432,3 +435,261 @@ class TestWriteInfluxdb:
         monkeypatch.setenv("INFLUXDB_TOKEN", "test")
         # Empty list — should return without making a request
         write_influxdb([])
+
+    def test_partial_env_vars_reports_missing(self, monkeypatch):
+        """Should report which specific vars are missing."""
+        monkeypatch.setenv("INFLUXDB_URL", "http://localhost:8086")
+        monkeypatch.delenv("INFLUXDB_ORG", raising=False)
+        monkeypatch.delenv("INFLUXDB_BUCKET", raising=False)
+        monkeypatch.setenv("INFLUXDB_TOKEN", "test")
+        with pytest.raises(SystemExit):
+            write_influxdb([{"ts": datetime.now(AEDT), "measurement": "x", "tags": {}, "value": 1}])
+
+
+# ---------------------------------------------------------------------------
+# Downsample intervals
+# ---------------------------------------------------------------------------
+
+
+class TestDownsampleIntervals:
+    """Test different downsample intervals including the new 300s default."""
+
+    def test_300s_default_interval(self, peakhurst_image):
+        """Default 5-min downsample should produce ~289 points per metric."""
+        results = extract_graph(peakhurst_image, "peakhurst", DATE)
+        dl = [r for r in results if r["tags"]["metric"] == "download"]
+        downsampled = downsample(dl, 300)
+        # 24h / 5min = 288 buckets, but coverage may be slightly more
+        assert 280 <= len(downsampled) <= 295
+
+    def test_60s_vs_300s_point_count(self, peakhurst_image):
+        """300s interval should produce significantly fewer points than 60s."""
+        results = extract_graph(peakhurst_image, "peakhurst", DATE)
+        dl = [r for r in results if r["tags"]["metric"] == "download"]
+        ds_60 = downsample(dl, 60)
+        ds_300 = downsample(dl, 300)
+        # Raw points are ~1.67min apart so 60s doesn't reduce much,
+        # but 300s should be roughly 3x fewer
+        assert len(ds_60) > len(ds_300) * 2
+
+    def test_300s_preserves_value_range(self, peakhurst_image):
+        """Downsampling should preserve approximate min/max values."""
+        results = extract_graph(peakhurst_image, "peakhurst", DATE)
+        dl = [r for r in results if r["tags"]["metric"] == "download"]
+        raw_max = max(r["value"] for r in dl)
+        raw_min = min(r["value"] for r in dl)
+        ds = downsample(dl, 300)
+        ds_max = max(r["value"] for r in ds)
+        ds_min = min(r["value"] for r in ds)
+        # Averages dampen extremes slightly, but should be close
+        assert ds_max == pytest.approx(raw_max, rel=0.15)
+        assert ds_min == pytest.approx(raw_min, rel=0.3)
+
+    def test_300s_timestamps_aligned(self, peakhurst_image):
+        """Downsampled timestamps should be aligned to 5-minute boundaries."""
+        results = extract_graph(peakhurst_image, "peakhurst", DATE)
+        dl = [r for r in results if r["tags"]["metric"] == "download"]
+        ds = downsample(dl, 300)
+        for r in ds:
+            assert int(r["ts"].timestamp()) % 300 == 0
+
+
+# ---------------------------------------------------------------------------
+# POI discovery
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverPois:
+    """Test POI discovery with mocked HTTP responses."""
+
+    SAMPLE_HTML = (
+        '"https://cvcs.aussiebroadband.com.au/peakhurst.png","peakhurst","Peakhurst",'
+        '"https://cvcs.aussiebroadband.com.au/peakhurstlink2.png","peakhurstlink2","Peakhurst (Link 2)",'
+        '"https://cvcs.aussiebroadband.com.au/darwin.png","darwin","Darwin",'
+    )
+
+    def test_parses_pois_from_html(self):
+        """discover_pois should extract slug and name from Nuxt payload."""
+        with patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = self.SAMPLE_HTML.encode()
+
+            pois = discover_pois()
+
+        slugs = [p["slug"] for p in pois]
+        assert "peakhurst" in slugs
+        assert "peakhurstlink2" in slugs
+        assert "darwin" in slugs
+
+    def test_returns_sorted_by_slug(self):
+        with patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = self.SAMPLE_HTML.encode()
+
+            pois = discover_pois()
+
+        slugs = [p["slug"] for p in pois]
+        assert slugs == sorted(slugs)
+
+    def test_deduplicates_slugs(self):
+        duped_html = self.SAMPLE_HTML + self.SAMPLE_HTML  # same POIs twice
+        with patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = duped_html.encode()
+
+            pois = discover_pois()
+
+        slugs = [p["slug"] for p in pois]
+        assert len(slugs) == len(set(slugs))
+
+    def test_includes_display_name(self):
+        with patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = self.SAMPLE_HTML.encode()
+
+            pois = discover_pois()
+
+        by_slug = {p["slug"]: p["name"] for p in pois}
+        assert by_slug["peakhurst"] == "Peakhurst"
+        assert by_slug["peakhurstlink2"] == "Peakhurst (Link 2)"
+
+    def test_empty_page_returns_empty(self):
+        with patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = b"<html>no data</html>"
+
+            pois = discover_pois()
+
+        assert pois == []
+
+
+# ---------------------------------------------------------------------------
+# CLI integration
+# ---------------------------------------------------------------------------
+
+
+class TestCLI:
+    """Test the main() CLI entrypoint with various argument combinations."""
+
+    def test_single_poi_influx_output(self, peakhurst_image, capsys):
+        """--poi with a local image should produce influx line protocol on stdout."""
+        with patch(
+            "sys.argv", ["prog", str(peakhurst_image), "--poi", "peakhurst", "--date", DATE]
+        ):
+            main()
+
+        captured = capsys.readouterr()
+        lines = [line for line in captured.out.strip().split("\n") if line]
+        assert len(lines) > 0
+        assert all(line.startswith("abb_cvc,") for line in lines)
+
+    def test_csv_format(self, peakhurst_image, capsys):
+        with patch(
+            "sys.argv",
+            ["prog", str(peakhurst_image), "--poi", "peakhurst", "--date", DATE, "--format", "csv"],
+        ):
+            main()
+
+        captured = capsys.readouterr()
+        lines = captured.out.strip().split("\n")
+        assert lines[0] == "timestamp,poi,metric,value_mbps"
+        assert len(lines) > 100
+
+    def test_custom_interval(self, peakhurst_image, capsys):
+        """--interval 600 should produce fewer points than default 300."""
+        with patch(
+            "sys.argv",
+            [
+                "prog",
+                str(peakhurst_image),
+                "--poi",
+                "peakhurst",
+                "--date",
+                DATE,
+                "--interval",
+                "600",
+                "--format",
+                "csv",
+            ],
+        ):
+            main()
+
+        captured = capsys.readouterr()
+        lines = [
+            line
+            for line in captured.out.strip().split("\n")
+            if line and not line.startswith("timestamp")
+        ]
+        dl_lines = [line for line in lines if "download" in line]
+        # 24h / 10min = ~144 points
+        assert 130 <= len(dl_lines) <= 150
+
+    def test_discover_list(self, capsys):
+        """--discover-list should print slugs, one per line."""
+        sample_html = (
+            '"https://cvcs.aussiebroadband.com.au/alpha.png","alpha","Alpha",'
+            '"https://cvcs.aussiebroadband.com.au/beta.png","beta","Beta",'
+        )
+        with (
+            patch("sys.argv", ["prog", "--discover-list"]),
+            patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen,
+        ):
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = sample_html.encode()
+            main()
+
+        captured = capsys.readouterr()
+        slugs = captured.out.strip().split("\n")
+        assert slugs == ["alpha", "beta"]
+
+    def test_write_influxdb_per_poi(self, peakhurst_image, monkeypatch):
+        """--write-influxdb should call write_influxdb once per POI."""
+        monkeypatch.setenv("INFLUXDB_URL", "http://localhost:8086")
+        monkeypatch.setenv("INFLUXDB_ORG", "test")
+        monkeypatch.setenv("INFLUXDB_BUCKET", "test")
+        monkeypatch.setenv("INFLUXDB_TOKEN", "test")
+
+        calls = []
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "prog",
+                    str(peakhurst_image),
+                    "--poi",
+                    "peakhurst",
+                    "--date",
+                    DATE,
+                    "--write-influxdb",
+                ],
+            ),
+            patch("abb_cvc_extract.write_influxdb", side_effect=lambda pts: calls.append(len(pts))),
+        ):
+            main()
+
+        assert len(calls) == 1
+        assert calls[0] > 0
+
+    def test_no_args_exits(self):
+        """No arguments should exit with error."""
+        with patch("sys.argv", ["prog"]), pytest.raises(SystemExit):
+            main()
+
+    def test_yesterday_flag(self, peakhurst_image, capsys):
+        """--yesterday should resolve to a date string and not crash."""
+        with patch(
+            "sys.argv",
+            [
+                "prog",
+                str(peakhurst_image),
+                "--poi",
+                "peakhurst",
+                "--yesterday",
+                "--format",
+                "csv",
+            ],
+        ):
+            main()
+
+        captured = capsys.readouterr()
+        assert "timestamp,poi,metric,value_mbps" in captured.out

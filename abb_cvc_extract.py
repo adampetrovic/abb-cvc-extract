@@ -44,6 +44,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -622,8 +623,15 @@ def main():
     parser.add_argument(
         "--interval",
         type=int,
-        default=60,
-        help="Downsample interval in seconds (default: 60)",
+        default=300,
+        help="Downsample interval in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0,
+        help="Delay in seconds between POI downloads (default: 0). "
+        "Use with --discover to spread load, e.g. --delay 10.",
     )
     parser.add_argument(
         "--format",
@@ -660,63 +668,85 @@ def main():
             print(p["slug"])
         return
 
-    # --- Determine which POIs to process ---
-    targets: list[tuple[Path, str]] = []
+    # --- Build list of POI slugs to process ---
+    poi_slugs: list[str] = []
+    local_image: Path | None = None
 
     if args.image:
-        poi_name = (args.poi[0] if args.poi else None) or Path(args.image).stem
-        targets.append((Path(args.image), poi_name))
+        local_image = Path(args.image)
+        poi_slugs = [(args.poi[0] if args.poi else None) or local_image.stem]
 
     elif args.discover:
         pois = discover_pois()
         print(f"info: discovered {len(pois)} POIs", file=sys.stderr)
-        for p in pois:
-            try:
-                img_path = download_image(p["slug"])
-                targets.append((img_path, p["slug"]))
-            except SystemExit:
-                continue
+        poi_slugs = [p["slug"] for p in pois]
 
     elif args.poi:
         for poi_name in args.poi:
-            targets.append((download_image(poi_name), poi_name))
+            poi_slugs.append(poi_name)
             if args.all_links:
                 for i in range(2, 10):
-                    variant = f"{poi_name}link{i}"
-                    try:
-                        targets.append((download_image(variant), variant))
-                    except SystemExit:
-                        break
+                    poi_slugs.append(f"{poi_name}link{i}")
     else:
         parser.error("provide an image path, --poi, --discover, or --discover-list")
 
-    # --- Extract all targets ---
+    # --- Extract and output ---
+    # When writing to InfluxDB, flush per-POI to keep memory bounded
+    # and avoid a single massive write (540 POIs x ~2500 points = ~1.4M points).
+    # For stdout modes, accumulate for a single output.
     all_points: list[dict] = []
-    for image_path, poi_name in targets:
+    total_points = 0
+    total_pois = 0
+    failed_pois = 0
+
+    for i, slug in enumerate(poi_slugs):
+        # Rate-limit downloads to be polite to ABB servers
+        if i > 0 and args.delay > 0 and not local_image:
+            time.sleep(args.delay)
+
+        # Download or use local image
+        if local_image:
+            image_path = local_image
+        else:
+            try:
+                image_path = download_image(slug)
+            except SystemExit:
+                failed_pois += 1
+                continue
+
         try:
-            points = extract_graph(image_path, poi_name, args.date)
+            points = extract_graph(image_path, slug, args.date)
             points = downsample(points, args.interval)
-            all_points.extend(points)
+            total_points += len(points)
+            total_pois += 1
             print(
-                f"info: {poi_name}: {len(points)} points after {args.interval}s downsample",
+                f"info: {slug}: {len(points)} points after {args.interval}s downsample",
                 file=sys.stderr,
             )
+
+            if args.write_influxdb and points:
+                write_influxdb(points)
+            else:
+                all_points.extend(points)
         except Exception as e:
-            print(f"warning: {poi_name}: extraction failed: {e}", file=sys.stderr)
+            print(f"warning: {slug}: extraction failed: {e}", file=sys.stderr)
+            failed_pois += 1
         finally:
-            # Clean up downloaded temp images (not user-supplied)
-            if args.image is None or str(image_path) != args.image:
+            if not local_image:
                 image_path.unlink(missing_ok=True)
 
-    # --- Output ---
-    if args.write_influxdb:
-        write_influxdb(all_points)
-    elif args.format == "csv":
-        _output_csv(all_points)
-    else:
-        print(to_line_protocol(all_points))
+    # Flush accumulated points for stdout modes
+    if not args.write_influxdb:
+        if args.format == "csv":
+            _output_csv(all_points)
+        else:
+            print(to_line_protocol(all_points))
 
-    print(f"info: done — {len(all_points)} total points", file=sys.stderr)
+    print(
+        f"info: done — {total_pois} POIs, {total_points} points"
+        + (f", {failed_pois} failed" if failed_pois else ""),
+        file=sys.stderr,
+    )
 
 
 def _output_csv(points: list[dict]) -> None:
