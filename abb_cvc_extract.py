@@ -35,18 +35,22 @@ Environment variables (for --write-influxdb):
     INFLUXDB_ORG     InfluxDB organisation ID
     INFLUXDB_BUCKET  InfluxDB bucket name
     INFLUXDB_TOKEN   InfluxDB API token
+    LOG_LEVEL        Logging level (default: INFO)
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import os
 import re
 import sys
 import tempfile
 import time
+import traceback
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import cv2
@@ -56,6 +60,63 @@ ABB_CVC_URL = "https://cvcs.aussiebroadband.com.au/{poi}.png"
 ABB_CVC_PAGE = "https://www.aussiebroadband.com.au/network/cvc-graphs/"
 AEDT = timezone(timedelta(hours=11))
 AEST = timezone(timedelta(hours=10))
+
+
+# ---------------------------------------------------------------------------
+# Structured JSON logging
+# ---------------------------------------------------------------------------
+
+
+class JSONFormatter(logging.Formatter):
+    """Emit one JSON object per log line for Loki/Vector/Promtail ingestion."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict = {
+            "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat().replace("+00:00", "Z"),
+            "level": record.levelname.lower(),
+            "msg": record.getMessage(),
+        }
+        # Merge any structured fields passed via `extra=`
+        for key in (
+            "poi",
+            "date",
+            "points",
+            "bytes",
+            "status",
+            "scale_max",
+            "capacity",
+            "gridlines",
+            "x_labels",
+            "download",
+            "upload",
+            "interval",
+            "total_pois",
+            "total_points",
+            "failed_pois",
+            "missing_vars",
+            "error",
+        ):
+            val = getattr(record, key, None)
+            if val is not None:
+                entry[key] = val
+        if record.exc_info and record.exc_info[0] is not None:
+            entry["error"] = "".join(traceback.format_exception(*record.exc_info)).rstrip()
+        return json.dumps(entry, default=str)
+
+
+def setup_logging() -> logging.Logger:
+    """Configure structured JSON logging to stderr."""
+    logger = logging.getLogger("abb_cvc_extract")
+    if logger.handlers:
+        return logger
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(JSONFormatter())
+    logger.addHandler(handler)
+    logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+    return logger
+
+
+log = setup_logging()
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +181,7 @@ def download_image(poi: str) -> Path:
         with urllib.request.urlopen(req) as resp:
             tmp.write_bytes(resp.read())
     except urllib.error.HTTPError as e:
-        print(f"error: failed to download {url}: {e}", file=sys.stderr)
+        log.error("Failed to download image", extra={"poi": poi, "error": str(e)})
         sys.exit(1)
     return tmp
 
@@ -156,9 +217,8 @@ def find_gridlines_y(rgb: np.ndarray) -> list[int]:
         avg_spacing = round(sum(spacings) / len(spacings))
         inferred = gridlines[-1] + avg_spacing
         gridlines.append(inferred)
-        print(
-            f"info: inferred 5th gridline at y={inferred} (spacing={avg_spacing}px)",
-            file=sys.stderr,
+        log.debug(
+            "Inferred 5th gridline", extra={"gridline_y": inferred, "spacing_px": avg_spacing}
         )
 
     return gridlines
@@ -297,10 +357,7 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
     """
     n = len(gridlines)
     if n < 4:
-        print(
-            f"warning: expected 5 gridlines, found {n}. Using default scale.",
-            file=sys.stderr,
-        )
+        log.warning("Insufficient gridlines, using default scale", extra={"gridlines": n})
         step = 10600 / 4
         return [10600 - i * step for i in range(n)]
 
@@ -346,11 +403,6 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
     else:
         candidates = [10600]  # safe default
 
-    print(
-        f"info: label digit pattern={digit_counts}, candidates={candidates}",
-        file=sys.stderr,
-    )
-
     # --- Step 2: Use blue line position to determine exact scale ---
     blue_mask_arr = (rgb[:, :, 0] < 110) & (rgb[:, :, 1] > 140) & (rgb[:, :, 2] > 180)
     blue_ys = np.where(blue_mask_arr)[0]
@@ -372,18 +424,15 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
 
         if best:
             max_mbps, capacity = best
-            print(
-                f"info: detected scale max={max_mbps} Mbps, "
-                f"CVC capacity={capacity} Mbps (blue y={blue_y}, "
-                f"digits={digit_counts}, "
-                f"widths={label_widths[:3]})",
-                file=sys.stderr,
+            log.debug(
+                "Detected scale",
+                extra={"scale_max": max_mbps, "capacity": capacity},
             )
             return [max_mbps - i * (max_mbps / 4) for i in range(n)]
 
     # Fallback: use label width heuristic alone
     max_mbps = candidates[0]
-    print(f"warning: using fallback scale max={max_mbps} Mbps", file=sys.stderr)
+    log.warning("Using fallback scale", extra={"scale_max": max_mbps})
     return [max_mbps - i * (max_mbps / 4) for i in range(n)]
 
 
@@ -396,7 +445,7 @@ def extract_graph(image_path: Path, poi: str, date_str: str | None = None) -> li
     """Extract all time-series data from a CVC graph image."""
     img = cv2.imread(str(image_path))
     if img is None:
-        print(f"error: cannot read image {image_path}", file=sys.stderr)
+        log.error("Cannot read image", extra={"poi": poi, "error": str(image_path)})
         sys.exit(1)
 
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -407,10 +456,14 @@ def extract_graph(image_path: Path, poi: str, date_str: str | None = None) -> li
     x_labels = find_label_centers_x(rgb)
     mbps_values = detect_mbps_scale(gridlines, rgb)
 
-    print(
-        f"info: gridlines={gridlines}, x_labels={len(x_labels)}, "
-        f"scale={mbps_values[0]:.0f}-{mbps_values[-1]:.0f} Mbps",
-        file=sys.stderr,
+    log.debug(
+        "Graph calibration",
+        extra={
+            "poi": poi,
+            "gridlines": gridlines,
+            "x_labels": len(x_labels),
+            "scale_max": mbps_values[0],
+        },
     )
 
     # Parse date
@@ -418,9 +471,9 @@ def extract_graph(image_path: Path, poi: str, date_str: str | None = None) -> li
         base_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=AEDT)
     else:
         base_date = datetime.now(AEDT).replace(hour=0, minute=0, second=0, microsecond=0)
-        print(
-            f"info: no date specified, using {base_date.strftime('%Y-%m-%d')}",
-            file=sys.stderr,
+        log.info(
+            "No date specified, using today",
+            extra={"poi": poi, "date": base_date.strftime("%Y-%m-%d")},
         )
 
     # --- Extract lines ---
@@ -438,7 +491,6 @@ def extract_graph(image_path: Path, poi: str, date_str: str | None = None) -> li
         return (col[:, 0] < 110) & (col[:, 1] > 140) & (col[:, 2] > 180)
 
     # Constrain search to within gridline bounds (with small margin).
-    # Using gridlines[0] avoids title text and other artifacts above the plot area.
     y_top = gridlines[0] - 5
     y_bot = gridlines[-1] + 10
 
@@ -446,10 +498,14 @@ def extract_graph(image_path: Path, poi: str, date_str: str | None = None) -> li
     green_points = extract_line(rgb, x_left, x_right, green_mask, gridlines[-3], y_bot)
     blue_points = extract_line(rgb, x_left, x_right, blue_mask, y_top, y_bot)
 
-    print(
-        f"info: extracted {len(black_points)} download, "
-        f"{len(green_points)} upload, {len(blue_points)} capacity points",
-        file=sys.stderr,
+    log.debug(
+        "Line extraction complete",
+        extra={
+            "poi": poi,
+            "download": len(black_points),
+            "upload": len(green_points),
+            "capacity": len(blue_points),
+        },
     )
 
     # --- Convert to time-series ---
@@ -546,10 +602,7 @@ def write_influxdb(points: list[dict]) -> None:
     required = ("INFLUXDB_URL", "INFLUXDB_ORG", "INFLUXDB_BUCKET", "INFLUXDB_TOKEN")
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
-        print(
-            f"error: missing environment variables for --write-influxdb: {', '.join(missing)}",
-            file=sys.stderr,
-        )
+        log.error("Missing InfluxDB environment variables", extra={"missing_vars": missing})
         sys.exit(1)
 
     url = os.environ["INFLUXDB_URL"]
@@ -559,7 +612,7 @@ def write_influxdb(points: list[dict]) -> None:
 
     data = to_line_protocol(points).encode()
     if not data:
-        print("info: no data to write", file=sys.stderr)
+        log.info("No data to write")
         return
 
     write_url = f"{url}/api/v2/write?org={org}&bucket={bucket}&precision=s"
@@ -574,15 +627,15 @@ def write_influxdb(points: list[dict]) -> None:
     )
     try:
         resp = urllib.request.urlopen(req)
-        print(
-            f"info: wrote {len(data)} bytes ({len(points)} points) to InfluxDB, HTTP {resp.status}",
-            file=sys.stderr,
+        log.info(
+            "Wrote to InfluxDB",
+            extra={"bytes": len(data), "points": len(points), "status": resp.status},
         )
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:500]
-        print(
-            f"error: InfluxDB write failed: HTTP {e.code} {e.reason}\n{body}",
-            file=sys.stderr,
+        log.error(
+            "InfluxDB write failed",
+            extra={"status": e.code, "error": body},
         )
         sys.exit(1)
 
@@ -659,7 +712,7 @@ def main():
     # Resolve date
     if args.yesterday:
         args.date = yesterday_date()
-        print(f"info: using yesterday's date: {args.date}", file=sys.stderr)
+        log.info("Using yesterday's date", extra={"date": args.date})
 
     # --- Discovery: just list slugs ---
     if args.discover_list:
@@ -678,7 +731,7 @@ def main():
 
     elif args.discover:
         pois = discover_pois()
-        print(f"info: discovered {len(pois)} POIs", file=sys.stderr)
+        log.info("Discovered POIs", extra={"total_pois": len(pois)})
         poi_slugs = [p["slug"] for p in pois]
 
     elif args.poi:
@@ -719,17 +772,17 @@ def main():
             points = downsample(points, args.interval)
             total_points += len(points)
             total_pois += 1
-            print(
-                f"info: {slug}: {len(points)} points after {args.interval}s downsample",
-                file=sys.stderr,
+            log.info(
+                "Extracted POI",
+                extra={"poi": slug, "points": len(points), "interval": args.interval},
             )
 
             if args.write_influxdb and points:
                 write_influxdb(points)
             else:
                 all_points.extend(points)
-        except Exception as e:
-            print(f"warning: {slug}: extraction failed: {e}", file=sys.stderr)
+        except Exception:
+            log.exception("Extraction failed", extra={"poi": slug})
             failed_pois += 1
         finally:
             if not local_image:
@@ -742,10 +795,9 @@ def main():
         else:
             print(to_line_protocol(all_points))
 
-    print(
-        f"info: done — {total_pois} POIs, {total_points} points"
-        + (f", {failed_pois} failed" if failed_pois else ""),
-        file=sys.stderr,
+    log.info(
+        "Run complete",
+        extra={"total_pois": total_pois, "total_points": total_points, "failed_pois": failed_pois},
     )
 
 
