@@ -6,38 +6,94 @@ Outputs InfluxDB line protocol to stdout.
 
 Usage:
     # Extract from a local image
-    python3 abb-cvc-extract.py /tmp/peakhurst_cvc.png
+    python3 abb_cvc_extract.py /tmp/peakhurst_cvc.png
 
     # Download and extract a POI by name
-    python3 abb-cvc-extract.py --poi peakhurst
+    python3 abb_cvc_extract.py --poi peakhurst
 
     # Download all POI variants (link2, link3, etc.)
-    python3 abb-cvc-extract.py --poi peakhurst --all-links
+    python3 abb_cvc_extract.py --poi peakhurst --all-links
 
     # Specify custom date (default: parsed from image title)
-    python3 abb-cvc-extract.py --poi peakhurst --date 2026-03-24
+    python3 abb_cvc_extract.py --poi peakhurst --date 2026-03-24
+
+    # Discover all POIs from ABB website
+    python3 abb_cvc_extract.py --discover
+
+    # Process all discovered POIs
+    python3 abb_cvc_extract.py --discover --date 2026-03-24
 
     # Write directly to InfluxDB
-    python3 abb-cvc-extract.py --poi peakhurst | curl -s \\
-        "$INFLUXDB_URL/api/v2/write?org=$INFLUXDB_ORG&bucket=homeassistant&precision=s" \\
+    python3 abb_cvc_extract.py --poi peakhurst | curl -s \\
+        "$INFLUXDB_URL/api/v2/write?org=$INFLUXDB_ORG&bucket=abb-cvc&precision=s" \\
         -H "Authorization: Token $INFLUXDB_TOKEN" \\
         --data-binary @-
 """
+
+from __future__ import annotations
 
 import argparse
 import re
 import sys
 import tempfile
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 ABB_CVC_URL = "https://cvcs.aussiebroadband.com.au/{poi}.png"
+ABB_CVC_PAGE = "https://www.aussiebroadband.com.au/network/cvc-graphs/"
 AEDT = timezone(timedelta(hours=11))
 AEST = timezone(timedelta(hours=10))
+
+
+# ---------------------------------------------------------------------------
+# POI discovery
+# ---------------------------------------------------------------------------
+
+
+def discover_pois() -> list[dict[str, str]]:
+    """Discover all CVC POIs from the ABB website.
+
+    Scrapes the CVC graphs page and extracts POI slugs and display names
+    from the embedded Nuxt payload.
+
+    Returns a list of dicts: [{"slug": "peakhurst", "name": "Peakhurst"}, ...]
+    """
+    req = urllib.request.Request(
+        ABB_CVC_PAGE,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.aussiebroadband.com.au/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    # The Nuxt SSR payload contains entries like:
+    #   "https://cvcs.aussiebroadband.com.au/peakhurst.png","peakhurst","Peakhurst"
+    pattern = re.compile(
+        r'cvcs\.aussiebroadband\.com\.au/([a-z0-9]+)\.png","([a-z0-9]+)","([^"]+)"'
+    )
+
+    pois = []
+    seen = set()
+    for match in pattern.finditer(html):
+        slug = match.group(2)
+        name = match.group(3)
+        if slug not in seen:
+            seen.add(slug)
+            pois.append({"slug": slug, "name": name})
+
+    pois.sort(key=lambda p: p["slug"])
+    return pois
+
+
+# ---------------------------------------------------------------------------
+# Image downloading
+# ---------------------------------------------------------------------------
 
 
 def download_image(poi: str) -> Path:
@@ -48,7 +104,7 @@ def download_image(poi: str) -> Path:
         url,
         headers={
             "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.aussiebroadband.com.au/network/cvc-graphs/",
+            "Referer": ABB_CVC_PAGE,
         },
     )
     try:
@@ -60,21 +116,42 @@ def download_image(poi: str) -> Path:
     return tmp
 
 
+# ---------------------------------------------------------------------------
+# Graph structure detection
+# ---------------------------------------------------------------------------
+
+
 def find_gridlines_y(rgb: np.ndarray) -> list[int]:
-    """Find horizontal gridlines by scanning for uniform gray rows."""
+    """Find horizontal gridlines by scanning for uniform gray rows.
+
+    ABB CVC graphs always have 5 gridlines at equal spacing. If only 4 are
+    detected (common when the 0 Mbps gridline is obscured by the black
+    download line), the 5th is inferred from the spacing of the other 4.
+    """
     h, w = rgb.shape[:2]
     gridlines = []
     for y in range(40, h - 40):
-        row = rgb[y, 80:w - 40, :]
+        row = rgb[y, 80 : w - 40, :]
         gray = (
             (np.abs(row[:, 0].astype(int) - row[:, 1].astype(int)) < 12)
             & (np.abs(row[:, 1].astype(int) - row[:, 2].astype(int)) < 12)
             & (row[:, 0] > 185)
             & (row[:, 0] < 248)
         )
-        if np.sum(gray) > (w * 0.7):
-            if not gridlines or y - gridlines[-1] > 10:
-                gridlines.append(y)
+        if np.sum(gray) > (w * 0.7) and (not gridlines or y - gridlines[-1] > 10):
+            gridlines.append(y)
+
+    # Infer the missing 5th (bottom / 0 Mbps) gridline from even spacing
+    if len(gridlines) == 4:
+        spacings = [gridlines[i + 1] - gridlines[i] for i in range(3)]
+        avg_spacing = round(sum(spacings) / len(spacings))
+        inferred = gridlines[-1] + avg_spacing
+        gridlines.append(inferred)
+        print(
+            f"info: inferred 5th gridline at y={inferred} (spacing={avg_spacing}px)",
+            file=sys.stderr,
+        )
+
     return gridlines
 
 
@@ -85,7 +162,7 @@ def find_label_centers_x(rgb: np.ndarray) -> list[int]:
     text_mask = (bottom[:, :, 0] < 100) & (bottom[:, :, 1] < 100) & (bottom[:, :, 2] < 100)
     text_cols = sorted(set(np.where(text_mask)[1]))
 
-    clusters = []
+    clusters: list[list[int]] = []
     for x in text_cols:
         if not clusters or x - clusters[-1][-1] > 8:
             clusters.append([x])
@@ -95,11 +172,9 @@ def find_label_centers_x(rgb: np.ndarray) -> list[int]:
     return [(c[0] + c[-1]) // 2 for c in clusters]
 
 
-def parse_title(rgb: np.ndarray) -> tuple[str, str | None]:
-    """Try to extract POI name and date from the title text area."""
-    # Title is in the top ~40px, centered. We can't OCR without tesseract,
-    # but we can return defaults. The caller should pass --date if needed.
-    return ("unknown", None)
+# ---------------------------------------------------------------------------
+# Line extraction
+# ---------------------------------------------------------------------------
 
 
 def extract_line(
@@ -125,7 +200,7 @@ def extract_line(
             # Find the largest contiguous cluster of matching pixels.
             # This rejects stray pixels from title text or other artifacts
             # that would otherwise skew the median.
-            clusters = []
+            clusters: list[list[int]] = []
             current = [matches[0]]
             for i in range(1, len(matches)):
                 if matches[i] - matches[i - 1] <= 3:  # allow small gaps (anti-aliasing)
@@ -142,9 +217,13 @@ def extract_line(
     return points
 
 
+# ---------------------------------------------------------------------------
+# Coordinate conversion
+# ---------------------------------------------------------------------------
+
+
 def pixel_to_mbps(y: int, gridlines: list[int], mbps_values: list[float]) -> float:
     """Convert pixel y-coordinate to Mbps using gridline calibration."""
-    # gridlines[0] = highest Mbps, gridlines[-1] = lowest (0)
     if len(gridlines) < 2:
         return 0.0
 
@@ -163,9 +242,7 @@ def pixel_to_mbps(y: int, gridlines: list[int], mbps_values: list[float]) -> flo
         return mbps_values[-1] + (y - gridlines[-1]) / px_per_mbps
 
 
-def pixel_to_timestamp(
-    x: int, x_labels: list[int], date: datetime
-) -> datetime:
+def pixel_to_timestamp(x: int, x_labels: list[int], date: datetime) -> datetime:
     """Convert pixel x-coordinate to timestamp using label positions.
 
     x_labels correspond to 00:00, 02:00, 04:00, ..., 24:00 (13 labels).
@@ -192,6 +269,11 @@ def pixel_to_timestamp(
     return date + timedelta(hours=max(0, min(24, hours)))
 
 
+# ---------------------------------------------------------------------------
+# Scale detection
+# ---------------------------------------------------------------------------
+
+
 def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
     """Detect the Mbps values for each gridline from Y-axis label positions.
 
@@ -205,8 +287,11 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
     3. Use the blue capacity line position to narrow down the exact scale.
     """
     n = len(gridlines)
-    if n != 5:
-        print(f"warning: expected 5 gridlines, found {n}. Using default scale.", file=sys.stderr)
+    if n < 4:
+        print(
+            f"warning: expected 5 gridlines, found {n}. Using default scale.",
+            file=sys.stderr,
+        )
         step = 10600 / 4
         return [10600 - i * step for i in range(n)]
 
@@ -215,7 +300,7 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
     text_mask = (left[:, :, 0] < 100) & (left[:, :, 1] < 100) & (left[:, :, 2] < 100)
 
     rows = sorted(set(np.where(text_mask)[0]))
-    row_clusters = []
+    row_clusters: list[list[int]] = []
     for y in rows:
         if not row_clusters or y - row_clusters[-1][-1] > 5:
             row_clusters.append([y])
@@ -227,32 +312,20 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
         label_text = text_mask[c[0] : c[-1] + 1, :]
         cols_with_text = np.where(np.any(label_text, axis=0))[0]
         if len(cols_with_text) > 0:
-            label_widths.append(cols_with_text[-1] - cols_with_text[0])
+            label_widths.append(int(cols_with_text[-1] - cols_with_text[0]))
         else:
             label_widths.append(0)
 
     # Determine digit count of each label from width.
-    # 5-digit labels are ~10-15% wider than 4-digit labels.
-    # Use relative widths to classify: top, 2nd, 3rd, 4th labels.
-    # The 5th label (bottom, "0") is always narrow.
-    digit_counts = []
+    digit_counts: list[int] = []
     if len(label_widths) >= 4:
-        median_4digit = np.median(sorted(label_widths[:4])[1:3])  # middle two
+        median_4digit = float(np.median(sorted(label_widths[:4])[1:3]))
         for w_px in label_widths[:4]:
             digit_counts.append(5 if w_px > median_4digit * 1.05 else 4)
 
-    # Use the digit pattern to determine the scale:
-    # max=10600  → digits: [5, 4, 4, 4]  (10600, 7950, 5300, 2650)
-    # max=5300   → digits: [4, 4, 4, 4]  (5300, 3975, 2650, 1325)
-    # max=2650   → digits: [4, 4, 4, 3]  (2650, 1987, 1325, 662)
-    # max=13250  → digits: [5, 4, 4, 4]  (13250, 9937, 6625, 3312) - 2nd could be 4-digit
-    # max=15900  → digits: [5, 5, 4, 4]  (15900, 11925, 7950, 3975)
-    # max=21200  → digits: [5, 5, 5, 4]  (21200, 15900, 10600, 5300)
-
-    # Key insight: for max=10600, ONLY the top label is 5-digit.
-    # For max=15900+, the 2nd label is also 5-digit.
+    # Use the digit pattern to determine the scale
     if digit_counts == [5, 4, 4, 4]:
-        candidates = [10600]  # only standard ABB scale with this digit pattern
+        candidates = [10600]
     elif digit_counts == [5, 5, 4, 4]:
         candidates = [15900]
     elif digit_counts == [5, 5, 5, 4]:
@@ -264,7 +337,10 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
     else:
         candidates = [10600]  # safe default
 
-    print(f"info: label digit pattern={digit_counts}, candidates={candidates}", file=sys.stderr)
+    print(
+        f"info: label digit pattern={digit_counts}, candidates={candidates}",
+        file=sys.stderr,
+    )
 
     # --- Step 2: Use blue line position to determine exact scale ---
     blue_mask_arr = (rgb[:, :, 0] < 110) & (rgb[:, :, 1] > 140) & (rgb[:, :, 2] > 180)
@@ -294,17 +370,20 @@ def detect_mbps_scale(gridlines: list[int], rgb: np.ndarray) -> list[float]:
                 f"widths={label_widths[:3]})",
                 file=sys.stderr,
             )
-            return [max_mbps - i * (max_mbps / 4) for i in range(5)]
+            return [max_mbps - i * (max_mbps / 4) for i in range(n)]
 
     # Fallback: use label width heuristic alone
     max_mbps = candidates[0]
     print(f"warning: using fallback scale max={max_mbps} Mbps", file=sys.stderr)
-    return [max_mbps - i * (max_mbps / 4) for i in range(5)]
+    return [max_mbps - i * (max_mbps / 4) for i in range(n)]
 
 
-def extract_graph(
-    image_path: Path, poi: str, date_str: str | None = None
-) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Graph extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_graph(image_path: Path, poi: str, date_str: str | None = None) -> list[dict]:
     """Extract all time-series data from a CVC graph image."""
     img = cv2.imread(str(image_path))
     if img is None:
@@ -312,7 +391,7 @@ def extract_graph(
         sys.exit(1)
 
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    h, w = img.shape[:2]
+    _h, w = img.shape[:2]
 
     # --- Calibration ---
     gridlines = find_gridlines_y(rgb)
@@ -329,12 +408,7 @@ def extract_graph(
     if date_str:
         base_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=AEDT)
     else:
-        # Try to extract from image filename or title
-        # ABB images show date in title like "24/03/2026"
-        # Without OCR, default to today
-        base_date = datetime.now(AEDT).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        base_date = datetime.now(AEDT).replace(hour=0, minute=0, second=0, microsecond=0)
         print(
             f"info: no date specified, using {base_date.strftime('%Y-%m-%d')}",
             file=sys.stderr,
@@ -344,15 +418,13 @@ def extract_graph(
     x_left = x_labels[0] if x_labels else 70
     x_right = x_labels[-1] if x_labels else w - 30
 
-    # Black line: download/usage (dark pixels, exclude axis text area)
+    # Color masks
     def black_mask(col):
         return (col[:, 0] < 55) & (col[:, 1] < 55) & (col[:, 2] < 55)
 
-    # Green line: upload
     def green_mask(col):
         return (col[:, 1] > 100) & (col[:, 0] < 160) & (col[:, 2] < 100) & (col[:, 1] > col[:, 0])
 
-    # Blue line: CVC capacity (provisioned)
     def blue_mask(col):
         return (col[:, 0] < 110) & (col[:, 1] > 140) & (col[:, 2] > 180)
 
@@ -413,12 +485,16 @@ def extract_graph(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Post-processing
+# ---------------------------------------------------------------------------
+
+
 def downsample(points: list[dict], interval_seconds: int = 60) -> list[dict]:
     """Downsample points to one per interval by averaging."""
     if not points:
         return []
 
-    # Group by (metric, interval)
     buckets: dict[tuple[str, int], list[dict]] = {}
     for p in points:
         metric = p["tags"]["metric"]
@@ -427,11 +503,11 @@ def downsample(points: list[dict], interval_seconds: int = 60) -> list[dict]:
         buckets.setdefault(key, []).append(p)
 
     result = []
-    for (metric, bucket_ts), group in sorted(buckets.items()):
-        avg_val = np.mean([p["value"] for p in group])
+    for (_metric, bucket_ts), group in sorted(buckets.items()):
+        avg_val = float(np.mean([p["value"] for p in group]))
         representative = group[0].copy()
         representative["ts"] = datetime.fromtimestamp(bucket_ts, tz=AEDT)
-        representative["value"] = float(avg_val)
+        representative["value"] = avg_val
         result.append(representative)
 
     return result
@@ -443,8 +519,13 @@ def to_line_protocol(points: list[dict]) -> str:
     for p in sorted(points, key=lambda x: (x["tags"]["metric"], x["ts"])):
         tags = ",".join(f"{k}={v}" for k, v in sorted(p["tags"].items()))
         ts_unix = int(p["ts"].timestamp())
-        lines.append(f'{p["measurement"]},{tags} value={p["value"]:.1f} {ts_unix}')
+        lines.append(f"{p['measurement']},{tags} value={p['value']:.1f} {ts_unix}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -471,13 +552,65 @@ def main():
         default="influx",
         help="Output format (default: influx line protocol)",
     )
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Discover all POIs from ABB website. "
+        "If --poi is not set, lists discovered POIs. "
+        "If combined with --poi, ignored.",
+    )
+    parser.add_argument(
+        "--discover-list",
+        action="store_true",
+        help="Print all discovered POI slugs (one per line) and exit.",
+    )
     args = parser.parse_args()
 
-    if not args.image and not args.poi:
-        parser.error("provide either an image path or --poi name")
+    # --- Discovery mode: just list POIs ---
+    if args.discover_list:
+        pois = discover_pois()
+        for p in pois:
+            print(p["slug"])
+        return
 
-    # Collect all (image_path, poi_name) pairs to process
-    targets = []
+    # --- Discovery mode: process all POIs ---
+    if args.discover and not args.poi and not args.image:
+        pois = discover_pois()
+        print(f"info: discovered {len(pois)} POIs", file=sys.stderr)
+
+        all_points: list[dict] = []
+        for p in pois:
+            try:
+                img_path = download_image(p["slug"])
+            except SystemExit:
+                continue
+            try:
+                points = extract_graph(img_path, p["slug"], args.date)
+                points = downsample(points, args.interval)
+                all_points.extend(points)
+                print(
+                    f"info: {p['slug']}: {len(points)} points",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(
+                    f"warning: {p['slug']}: extraction failed: {e}",
+                    file=sys.stderr,
+                )
+            finally:
+                img_path.unlink(missing_ok=True)
+
+        if args.format == "csv":
+            _output_csv(all_points)
+        else:
+            print(to_line_protocol(all_points))
+        return
+
+    # --- Single/multi POI mode ---
+    if not args.image and not args.poi:
+        parser.error("provide either an image path, --poi name, or --discover")
+
+    targets: list[tuple[Path, str]] = []
     if args.image:
         poi = args.poi or Path(args.image).stem
         targets.append((Path(args.image), poi))
@@ -503,13 +636,16 @@ def main():
         )
 
     if args.format == "csv":
-        print("timestamp,poi,metric,value_mbps")
-        for p in sorted(all_points, key=lambda x: (x["tags"]["poi"], x["tags"]["metric"], x["ts"])):
-            print(
-                f'{p["ts"].isoformat()},{p["tags"]["poi"]},{p["tags"]["metric"]},{p["value"]:.1f}'
-            )
+        _output_csv(all_points)
     else:
         print(to_line_protocol(all_points))
+
+
+def _output_csv(points: list[dict]) -> None:
+    """Output points as CSV to stdout."""
+    print("timestamp,poi,metric,value_mbps")
+    for p in sorted(points, key=lambda x: (x["tags"]["poi"], x["tags"]["metric"], x["ts"])):
+        print(f"{p['ts'].isoformat()},{p['tags']['poi']},{p['tags']['metric']},{p['value']:.1f}")
 
 
 if __name__ == "__main__":
