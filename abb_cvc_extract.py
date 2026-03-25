@@ -2,37 +2,45 @@
 """
 Extract time-series data from Aussie Broadband CVC capacity graph images.
 
-Outputs InfluxDB line protocol to stdout.
+Outputs InfluxDB line protocol to stdout, or writes directly to InfluxDB.
 
 Usage:
+    # Extract a single POI
+    python3 abb_cvc_extract.py --poi peakhurst --date 2026-03-24
+
     # Extract from a local image
     python3 abb_cvc_extract.py /tmp/peakhurst_cvc.png
 
-    # Download and extract a POI by name
-    python3 abb_cvc_extract.py --poi peakhurst
+    # Extract specific POIs and write to InfluxDB
+    python3 abb_cvc_extract.py --poi peakhurst --poi peakhurstlink2 \\
+        --yesterday --write-influxdb
 
-    # Download all POI variants (link2, link3, etc.)
-    python3 abb_cvc_extract.py --poi peakhurst --all-links
+    # Extract all discovered POIs and write to InfluxDB (CronJob mode)
+    python3 abb_cvc_extract.py --discover --yesterday --write-influxdb
 
-    # Specify custom date (default: parsed from image title)
-    python3 abb_cvc_extract.py --poi peakhurst --date 2026-03-24
+    # List all discovered POI slugs
+    python3 abb_cvc_extract.py --discover-list
 
-    # Discover all POIs from ABB website
-    python3 abb_cvc_extract.py --discover
+    # Output as CSV
+    python3 abb_cvc_extract.py --poi peakhurst --date 2026-03-24 --format csv
 
-    # Process all discovered POIs
-    python3 abb_cvc_extract.py --discover --date 2026-03-24
-
-    # Write directly to InfluxDB
-    python3 abb_cvc_extract.py --poi peakhurst | curl -s \\
+    # Pipe to InfluxDB manually
+    python3 abb_cvc_extract.py --poi peakhurst --date 2026-03-24 | curl -s \\
         "$INFLUXDB_URL/api/v2/write?org=$INFLUXDB_ORG&bucket=abb-cvc&precision=s" \\
         -H "Authorization: Token $INFLUXDB_TOKEN" \\
         --data-binary @-
+
+Environment variables (for --write-influxdb):
+    INFLUXDB_URL     InfluxDB base URL (e.g. https://influx.example.com)
+    INFLUXDB_ORG     InfluxDB organisation ID
+    INFLUXDB_BUCKET  InfluxDB bucket name
+    INFLUXDB_TOKEN   InfluxDB API token
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import tempfile
@@ -524,6 +532,68 @@ def to_line_protocol(points: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# InfluxDB writer
+# ---------------------------------------------------------------------------
+
+
+def write_influxdb(points: list[dict]) -> None:
+    """Write points to InfluxDB using the v2 write API.
+
+    Reads connection details from environment variables:
+        INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN
+    """
+    required = ("INFLUXDB_URL", "INFLUXDB_ORG", "INFLUXDB_BUCKET", "INFLUXDB_TOKEN")
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        print(
+            f"error: missing environment variables for --write-influxdb: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    url = os.environ["INFLUXDB_URL"]
+    org = os.environ["INFLUXDB_ORG"]
+    bucket = os.environ["INFLUXDB_BUCKET"]
+    token = os.environ["INFLUXDB_TOKEN"]
+
+    data = to_line_protocol(points).encode()
+    if not data:
+        print("info: no data to write", file=sys.stderr)
+        return
+
+    write_url = f"{url}/api/v2/write?org={org}&bucket={bucket}&precision=s"
+    req = urllib.request.Request(
+        write_url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Token {token}",
+            "Content-Type": "text/plain",
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req)
+        print(
+            f"info: wrote {len(data)} bytes ({len(points)} points) to InfluxDB, HTTP {resp.status}",
+            file=sys.stderr,
+        )
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        print(
+            f"error: InfluxDB write failed: HTTP {e.code} {e.reason}\n{body}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def yesterday_date() -> str:
+    """Return yesterday's date in YYYY-MM-DD format (AEST)."""
+    now_aest = datetime.now(AEDT)
+    yesterday = now_aest - timedelta(days=1)
+    return yesterday.strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -533,13 +603,22 @@ def main():
         description="Extract time-series data from ABB CVC graph images"
     )
     parser.add_argument("image", nargs="?", help="Path to CVC graph image")
-    parser.add_argument("--poi", help="POI name (downloads from ABB if no image given)")
+    parser.add_argument(
+        "--poi",
+        action="append",
+        help="POI name to process (can be repeated). Downloads from ABB.",
+    )
     parser.add_argument(
         "--all-links",
         action="store_true",
-        help="Also download link2, link3, etc. variants",
+        help="Also download link2, link3, etc. variants for each --poi",
     )
     parser.add_argument("--date", help="Date for timestamps (YYYY-MM-DD)")
+    parser.add_argument(
+        "--yesterday",
+        action="store_true",
+        help="Use yesterday's date (AEST). Shorthand for CronJob usage.",
+    )
     parser.add_argument(
         "--interval",
         type=int,
@@ -555,90 +634,89 @@ def main():
     parser.add_argument(
         "--discover",
         action="store_true",
-        help="Discover all POIs from ABB website. "
-        "If --poi is not set, lists discovered POIs. "
-        "If combined with --poi, ignored.",
+        help="Discover and process all POIs from ABB website.",
     )
     parser.add_argument(
         "--discover-list",
         action="store_true",
         help="Print all discovered POI slugs (one per line) and exit.",
     )
+    parser.add_argument(
+        "--write-influxdb",
+        action="store_true",
+        help="Write results directly to InfluxDB (requires env vars).",
+    )
     args = parser.parse_args()
 
-    # --- Discovery mode: just list POIs ---
+    # Resolve date
+    if args.yesterday:
+        args.date = yesterday_date()
+        print(f"info: using yesterday's date: {args.date}", file=sys.stderr)
+
+    # --- Discovery: just list slugs ---
     if args.discover_list:
         pois = discover_pois()
         for p in pois:
             print(p["slug"])
         return
 
-    # --- Discovery mode: process all POIs ---
-    if args.discover and not args.poi and not args.image:
+    # --- Determine which POIs to process ---
+    targets: list[tuple[Path, str]] = []
+
+    if args.image:
+        poi_name = (args.poi[0] if args.poi else None) or Path(args.image).stem
+        targets.append((Path(args.image), poi_name))
+
+    elif args.discover:
         pois = discover_pois()
         print(f"info: discovered {len(pois)} POIs", file=sys.stderr)
-
-        all_points: list[dict] = []
         for p in pois:
             try:
                 img_path = download_image(p["slug"])
+                targets.append((img_path, p["slug"]))
             except SystemExit:
                 continue
-            try:
-                points = extract_graph(img_path, p["slug"], args.date)
-                points = downsample(points, args.interval)
-                all_points.extend(points)
-                print(
-                    f"info: {p['slug']}: {len(points)} points",
-                    file=sys.stderr,
-                )
-            except Exception as e:
-                print(
-                    f"warning: {p['slug']}: extraction failed: {e}",
-                    file=sys.stderr,
-                )
-            finally:
-                img_path.unlink(missing_ok=True)
 
-        if args.format == "csv":
-            _output_csv(all_points)
-        else:
-            print(to_line_protocol(all_points))
-        return
-
-    # --- Single/multi POI mode ---
-    if not args.image and not args.poi:
-        parser.error("provide either an image path, --poi name, or --discover")
-
-    targets: list[tuple[Path, str]] = []
-    if args.image:
-        poi = args.poi or Path(args.image).stem
-        targets.append((Path(args.image), poi))
+    elif args.poi:
+        for poi_name in args.poi:
+            targets.append((download_image(poi_name), poi_name))
+            if args.all_links:
+                for i in range(2, 10):
+                    variant = f"{poi_name}link{i}"
+                    try:
+                        targets.append((download_image(variant), variant))
+                    except SystemExit:
+                        break
     else:
-        targets.append((download_image(args.poi), args.poi))
-        if args.all_links:
-            for i in range(2, 10):
-                variant = f"{args.poi}link{i}"
-                try:
-                    img_path = download_image(variant)
-                    targets.append((img_path, variant))
-                except SystemExit:
-                    break
+        parser.error("provide an image path, --poi, --discover, or --discover-list")
 
-    all_points = []
-    for image_path, poi in targets:
-        points = extract_graph(image_path, poi, args.date)
-        points = downsample(points, args.interval)
-        all_points.extend(points)
-        print(
-            f"info: {poi}: {len(points)} points after {args.interval}s downsample",
-            file=sys.stderr,
-        )
+    # --- Extract all targets ---
+    all_points: list[dict] = []
+    for image_path, poi_name in targets:
+        try:
+            points = extract_graph(image_path, poi_name, args.date)
+            points = downsample(points, args.interval)
+            all_points.extend(points)
+            print(
+                f"info: {poi_name}: {len(points)} points after {args.interval}s downsample",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"warning: {poi_name}: extraction failed: {e}", file=sys.stderr)
+        finally:
+            # Clean up downloaded temp images (not user-supplied)
+            if args.image is None or str(image_path) != args.image:
+                image_path.unlink(missing_ok=True)
 
-    if args.format == "csv":
+    # --- Output ---
+    if args.write_influxdb:
+        write_influxdb(all_points)
+    elif args.format == "csv":
         _output_csv(all_points)
     else:
         print(to_line_protocol(all_points))
+
+    print(f"info: done — {len(all_points)} total points", file=sys.stderr)
 
 
 def _output_csv(points: list[dict]) -> None:

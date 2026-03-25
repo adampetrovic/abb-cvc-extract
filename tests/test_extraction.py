@@ -24,6 +24,8 @@ from abb_cvc_extract import (
     pixel_to_mbps,
     pixel_to_timestamp,
     to_line_protocol,
+    write_influxdb,
+    yesterday_date,
 )
 
 AEDT = timezone(timedelta(hours=11))
@@ -384,3 +386,49 @@ class TestPixelToTimestamp:
         mid = (labels[0] + labels[1]) // 2
         ts = pixel_to_timestamp(mid, labels, base)
         assert base < ts < base + timedelta(hours=2)
+
+
+# ---------------------------------------------------------------------------
+# Yesterday date helper
+# ---------------------------------------------------------------------------
+
+
+class TestYesterdayDate:
+    def test_returns_valid_date(self):
+        result = yesterday_date()
+        # Should be a valid YYYY-MM-DD string
+        parsed = datetime.strptime(result, "%Y-%m-%d")
+        assert parsed is not None
+
+    def test_is_before_today(self):
+        result = yesterday_date()
+        parsed = datetime.strptime(result, "%Y-%m-%d").replace(tzinfo=AEDT)
+        now = datetime.now(AEDT).replace(hour=0, minute=0, second=0, microsecond=0)
+        assert parsed < now
+
+
+# ---------------------------------------------------------------------------
+# InfluxDB writer
+# ---------------------------------------------------------------------------
+
+
+class TestWriteInfluxdb:
+    def test_missing_env_vars(self, peakhurst_image, monkeypatch):
+        """Should exit with error when env vars are missing."""
+        monkeypatch.delenv("INFLUXDB_URL", raising=False)
+        monkeypatch.delenv("INFLUXDB_ORG", raising=False)
+        monkeypatch.delenv("INFLUXDB_BUCKET", raising=False)
+        monkeypatch.delenv("INFLUXDB_TOKEN", raising=False)
+
+        results = extract_graph(peakhurst_image, "peakhurst", DATE)
+        with pytest.raises(SystemExit):
+            write_influxdb(results)
+
+    def test_empty_points_no_error(self, monkeypatch):
+        """Writing empty points should not raise."""
+        monkeypatch.setenv("INFLUXDB_URL", "http://localhost:8086")
+        monkeypatch.setenv("INFLUXDB_ORG", "test")
+        monkeypatch.setenv("INFLUXDB_BUCKET", "test")
+        monkeypatch.setenv("INFLUXDB_TOKEN", "test")
+        # Empty list — should return without making a request
+        write_influxdb([])
