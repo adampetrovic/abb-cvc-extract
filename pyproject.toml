@@ -1,6 +1,6 @@
 [project]
 name = "abb-cvc-extract"
-version = "1.1.0"
+version = "1.4.1"
 description = "Extract time-series data from Aussie Broadband CVC capacity graph images"
 requires-python = ">=3.12"
 license = "MIT"

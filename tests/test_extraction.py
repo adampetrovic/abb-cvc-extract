@@ -531,6 +531,25 @@ class TestDiscoverPois:
         slugs = [p["slug"] for p in pois]
         assert slugs == sorted(slugs)
 
+    def test_parses_escaped_nuxt_urls(self):
+        """ABB's live Nuxt payload escapes URL slashes as \u002f."""
+        escaped_html = (
+            '"https:\\u002F\\u002Fcvcs.aussiebroadband.com.au\\u002Falpha.png",'
+            '"alpha","Alpha",'
+            '"https:\\u002F\\u002Fcvcs.aussiebroadband.com.au\\u002Fbetalink2.png",'
+            '"betalink2","Beta (Link 2)",'
+        )
+        with patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = escaped_html.encode()
+
+            pois = discover_pois()
+
+        assert pois == [
+            {"slug": "alpha", "name": "Alpha"},
+            {"slug": "betalink2", "name": "Beta (Link 2)"},
+        ]
+
     def test_deduplicates_slugs(self):
         duped_html = self.SAMPLE_HTML + self.SAMPLE_HTML  # same POIs twice
         with patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen:
@@ -641,6 +660,24 @@ class TestCLI:
         captured = capsys.readouterr()
         slugs = captured.out.strip().split("\n")
         assert slugs == ["alpha", "beta"]
+
+    def test_discover_exits_when_no_pois(self, monkeypatch):
+        """CronJob discovery mode should fail loudly rather than succeed with no work."""
+        monkeypatch.setenv("INFLUXDB_URL", "http://localhost:8086")
+        monkeypatch.setenv("INFLUXDB_ORG", "test")
+        monkeypatch.setenv("INFLUXDB_BUCKET", "test")
+        monkeypatch.setenv("INFLUXDB_TOKEN", "test")
+
+        with (
+            patch("sys.argv", ["prog", "--discover", "--write-influxdb"]),
+            patch("abb_cvc_extract.urllib.request.urlopen") as mock_urlopen,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            mock_resp = mock_urlopen.return_value.__enter__.return_value
+            mock_resp.read.return_value = b"<html>no data</html>"
+            main()
+
+        assert exc_info.value.code == 1
 
     def test_write_influxdb_per_poi(self, peakhurst_image, monkeypatch):
         """--write-influxdb should call write_influxdb once per POI."""

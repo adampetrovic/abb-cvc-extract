@@ -142,6 +142,11 @@ def discover_pois() -> list[dict[str, str]]:
     with urllib.request.urlopen(req, timeout=30) as resp:
         html = resp.read().decode("utf-8", errors="replace")
 
+    # The Nuxt SSR payload escapes URL slashes as \u002F, but older/static
+    # captures may contain literal slashes. Normalize before matching so
+    # discovery keeps working across either representation.
+    html = html.replace(r"\u002F", "/")
+
     # The Nuxt SSR payload contains entries like:
     #   "https://cvcs.aussiebroadband.com.au/peakhurst.png","peakhurst","Peakhurst"
     pattern = re.compile(
@@ -732,6 +737,9 @@ def main():
     elif args.discover:
         pois = discover_pois()
         log.info("Discovered POIs", extra={"total_pois": len(pois)})
+        if not pois:
+            log.error("No POIs discovered")
+            sys.exit(1)
         poi_slugs = [p["slug"] for p in pois]
 
     elif args.poi:
