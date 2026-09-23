@@ -41,14 +41,15 @@ Environment variables (for --write-influxdb):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
 import re
 import sys
-import tempfile
 import time
 import traceback
+import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +59,7 @@ import numpy as np
 
 ABB_CVC_URL = "https://cvcs.aussiebroadband.com.au/{poi}.png"
 ABB_CVC_PAGE = "https://www.aussiebroadband.com.au/network/cvc-graphs/"
+DEFAULT_CACHE_DIR = Path(os.environ.get("ABB_CVC_CACHE_DIR", ".cache/abb-cvc-extract"))
 AEDT = timezone(timedelta(hours=11))
 AEST = timezone(timedelta(hours=10))
 
@@ -171,24 +173,55 @@ def discover_pois() -> list[dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 
-def download_image(poi: str) -> Path:
-    """Download CVC graph image for a POI."""
+def _cache_paths(cache_dir: Path, poi: str) -> tuple[Path, Path]:
+    """Return image and metadata cache paths for a POI."""
+    safe_poi = poi.lower().replace("/", "_")
+    return cache_dir / "images" / f"{safe_poi}.png", cache_dir / "images" / f"{safe_poi}.json"
+
+
+def download_image(poi: str, cache_dir: Path = DEFAULT_CACHE_DIR) -> Path:
+    """Download CVC graph image for a POI, reusing cached images when unchanged."""
     url = ABB_CVC_URL.format(poi=poi.lower())
-    tmp = Path(tempfile.mktemp(suffix=".png"))
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": ABB_CVC_PAGE,
-        },
-    )
+    image_path, meta_path = _cache_paths(cache_dir, poi)
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": ABB_CVC_PAGE,
+    }
+    if meta_path.exists() and image_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            if meta.get("etag"):
+                headers["If-None-Match"] = meta["etag"]
+            if meta.get("last_modified"):
+                headers["If-Modified-Since"] = meta["last_modified"]
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req) as resp:
-            tmp.write_bytes(resp.read())
+            image_path.write_bytes(resp.read())
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "url": url,
+                        "etag": resp.headers.get("ETag"),
+                        "last_modified": resp.headers.get("Last-Modified"),
+                        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    },
+                    sort_keys=True,
+                )
+            )
+            log.debug("Downloaded image", extra={"poi": poi, "status": resp.status})
     except urllib.error.HTTPError as e:
+        if e.code == 304 and image_path.exists():
+            log.debug("Using cached image", extra={"poi": poi})
+            return image_path
         log.error("Failed to download image", extra={"poi": poi, "error": str(e)})
         sys.exit(1)
-    return tmp
+    return image_path
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +284,14 @@ def find_label_centers_x(rgb: np.ndarray) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
+def _largest_cluster_median(matches: np.ndarray) -> int:
+    """Return median row offset for the largest near-contiguous cluster."""
+    split_points = np.flatnonzero(np.diff(matches) > 3) + 1
+    clusters = np.split(matches, split_points)
+    largest = max(clusters, key=len)
+    return int(np.median(largest))
+
+
 def extract_line(
     rgb: np.ndarray,
     x_left: int,
@@ -265,29 +306,21 @@ def extract_line(
     cluster-based detection to find the line and reject stray pixels
     (e.g. title text, axis labels, or other artifacts).
     """
-    points = []
-    for x in range(x_left, x_right + 1):
-        col = rgb[y_search_top:y_search_bot, x, :]
-        mask = color_mask_fn(col)
-        matches = np.where(mask)[0]
-        if len(matches) > 0:
-            # Find the largest contiguous cluster of matching pixels.
-            # This rejects stray pixels from title text or other artifacts
-            # that would otherwise skew the median.
-            clusters: list[list[int]] = []
-            current = [matches[0]]
-            for i in range(1, len(matches)):
-                if matches[i] - matches[i - 1] <= 3:  # allow small gaps (anti-aliasing)
-                    current.append(matches[i])
-                else:
-                    clusters.append(current)
-                    current = [matches[i]]
-            clusters.append(current)
+    region = rgb[y_search_top:y_search_bot, x_left : x_right + 1, :]
+    mask = color_mask_fn(region)
+    if not isinstance(mask, np.ndarray) or mask.shape != region.shape[:2]:
+        # Backwards-compatible path for callers whose mask functions only
+        # understand a single column shaped as ``(height, channels)``.
+        mask = np.empty(region.shape[:2], dtype=bool)
+        for x_offset in range(region.shape[1]):
+            mask[:, x_offset] = color_mask_fn(region[:, x_offset, :])
 
-            # Use the largest cluster (the actual line)
-            largest = max(clusters, key=len)
-            y = int(np.median(largest)) + y_search_top
-            points.append((x, y))
+    points = []
+    for x_offset in range(mask.shape[1]):
+        matches = np.flatnonzero(mask[:, x_offset])
+        if len(matches) > 0:
+            y = _largest_cluster_median(matches) + y_search_top
+            points.append((x_left + x_offset, y))
     return points
 
 
@@ -487,13 +520,18 @@ def extract_graph(image_path: Path, poi: str, date_str: str | None = None) -> li
 
     # Color masks
     def black_mask(col):
-        return (col[:, 0] < 55) & (col[:, 1] < 55) & (col[:, 2] < 55)
+        return (col[..., 0] < 55) & (col[..., 1] < 55) & (col[..., 2] < 55)
 
     def green_mask(col):
-        return (col[:, 1] > 100) & (col[:, 0] < 160) & (col[:, 2] < 100) & (col[:, 1] > col[:, 0])
+        return (
+            (col[..., 1] > 100)
+            & (col[..., 0] < 160)
+            & (col[..., 2] < 100)
+            & (col[..., 1] > col[..., 0])
+        )
 
     def blue_mask(col):
-        return (col[:, 0] < 110) & (col[:, 1] > 140) & (col[:, 2] > 180)
+        return (col[..., 0] < 110) & (col[..., 1] > 140) & (col[..., 2] > 180)
 
     # Constrain search to within gridline bounds (with small margin).
     y_top = gridlines[0] - 5
@@ -565,19 +603,19 @@ def downsample(points: list[dict], interval_seconds: int = 60) -> list[dict]:
     if not points:
         return []
 
-    buckets: dict[tuple[str, int], list[dict]] = {}
+    buckets: dict[tuple[str, int], tuple[float, int, dict]] = {}
     for p in points:
         metric = p["tags"]["metric"]
         bucket_ts = int(p["ts"].timestamp()) // interval_seconds * interval_seconds
         key = (metric, bucket_ts)
-        buckets.setdefault(key, []).append(p)
+        value_sum, count, representative = buckets.get(key, (0.0, 0, p))
+        buckets[key] = (value_sum + p["value"], count + 1, representative)
 
     result = []
-    for (_metric, bucket_ts), group in sorted(buckets.items()):
-        avg_val = float(np.mean([p["value"] for p in group]))
-        representative = group[0].copy()
+    for (_metric, bucket_ts), (value_sum, count, representative_point) in sorted(buckets.items()):
+        representative = representative_point.copy()
         representative["ts"] = datetime.fromtimestamp(bucket_ts, tz=AEDT)
-        representative["value"] = avg_val
+        representative["value"] = value_sum / count
         result.append(representative)
 
     return result
@@ -652,6 +690,19 @@ def yesterday_date() -> str:
     return yesterday.strftime("%Y-%m-%d")
 
 
+def process_poi(
+    slug: str,
+    date: str | None,
+    interval: int,
+    cache_dir: Path,
+    local_image: Path | None = None,
+) -> list[dict]:
+    """Download/cache, extract, and downsample a single POI."""
+    image_path = local_image or download_image(slug, cache_dir)
+    points = extract_graph(image_path, slug, date)
+    return downsample(points, interval)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -692,6 +743,18 @@ def main():
         "Use with --discover to spread load, e.g. --delay 10.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of POIs to download/extract in parallel (default: 1).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=DEFAULT_CACHE_DIR,
+        help=f"Image cache directory (default: {DEFAULT_CACHE_DIR}).",
+    )
+    parser.add_argument(
         "--format",
         choices=["influx", "csv"],
         default="influx",
@@ -711,6 +774,12 @@ def main():
         "--write-influxdb",
         action="store_true",
         help="Write results directly to InfluxDB (requires env vars).",
+    )
+    parser.add_argument(
+        "--influxdb-batch-size",
+        type=int,
+        default=50_000,
+        help="Maximum points per InfluxDB write batch (default: 50000).",
     )
     args = parser.parse_args()
 
@@ -752,51 +821,77 @@ def main():
         parser.error("provide an image path, --poi, --discover, or --discover-list")
 
     # --- Extract and output ---
-    # When writing to InfluxDB, flush per-POI to keep memory bounded
-    # and avoid a single massive write (540 POIs x ~2500 points = ~1.4M points).
-    # For stdout modes, accumulate for a single output.
     all_points: list[dict] = []
+    pending_influx_points: list[dict] = []
     total_points = 0
     total_pois = 0
     failed_pois = 0
+    workers = max(1, args.workers)
 
-    for i, slug in enumerate(poi_slugs):
-        # Rate-limit downloads to be polite to ABB servers
-        if i > 0 and args.delay > 0 and not local_image:
-            time.sleep(args.delay)
+    def handle_points(slug: str, points: list[dict]) -> None:
+        nonlocal total_points, total_pois, pending_influx_points
+        total_points += len(points)
+        total_pois += 1
+        log.info(
+            "Extracted POI",
+            extra={"poi": slug, "points": len(points), "interval": args.interval},
+        )
 
-        # Download or use local image
-        if local_image:
-            image_path = local_image
+        if args.write_influxdb:
+            pending_influx_points.extend(points)
+            while len(pending_influx_points) >= args.influxdb_batch_size:
+                batch = pending_influx_points[: args.influxdb_batch_size]
+                del pending_influx_points[: args.influxdb_batch_size]
+                write_influxdb(batch)
         else:
+            all_points.extend(points)
+
+    if workers == 1:
+        for i, slug in enumerate(poi_slugs):
+            # Rate-limit downloads to be polite to ABB servers.
+            if i > 0 and args.delay > 0 and not local_image:
+                time.sleep(args.delay)
             try:
-                image_path = download_image(slug)
+                points = process_poi(slug, args.date, args.interval, args.cache_dir, local_image)
+                handle_points(slug, points)
             except SystemExit:
                 failed_pois += 1
-                continue
+            except Exception:
+                log.exception("Extraction failed", extra={"poi": slug})
+                failed_pois += 1
+    else:
+        if local_image and len(poi_slugs) > 1:
+            log.warning("Parallel workers ignored for a single local image")
+            workers = 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for i, slug in enumerate(poi_slugs):
+                if i > 0 and args.delay > 0 and not local_image:
+                    time.sleep(args.delay)
+                future = executor.submit(
+                    process_poi,
+                    slug,
+                    args.date,
+                    args.interval,
+                    args.cache_dir,
+                    local_image,
+                )
+                futures[future] = slug
 
-        try:
-            points = extract_graph(image_path, slug, args.date)
-            points = downsample(points, args.interval)
-            total_points += len(points)
-            total_pois += 1
-            log.info(
-                "Extracted POI",
-                extra={"poi": slug, "points": len(points), "interval": args.interval},
-            )
+            for future in concurrent.futures.as_completed(futures):
+                slug = futures[future]
+                try:
+                    handle_points(slug, future.result())
+                except SystemExit:
+                    failed_pois += 1
+                except Exception:
+                    log.exception("Extraction failed", extra={"poi": slug})
+                    failed_pois += 1
 
-            if args.write_influxdb and points:
-                write_influxdb(points)
-            else:
-                all_points.extend(points)
-        except Exception:
-            log.exception("Extraction failed", extra={"poi": slug})
-            failed_pois += 1
-        finally:
-            if not local_image:
-                image_path.unlink(missing_ok=True)
+    if args.write_influxdb and pending_influx_points:
+        write_influxdb(pending_influx_points)
 
-    # Flush accumulated points for stdout modes
+    # Flush accumulated points for stdout modes.
     if not args.write_influxdb:
         if args.format == "csv":
             _output_csv(all_points)
