@@ -41,6 +41,9 @@ python3 abb_cvc_extract.py --poi peakhurst --date 2026-03-24
 | `--all-links` | Also download link2, link3, … variants |
 | `--date YYYY-MM-DD` | Date for timestamps (default: today AEST) |
 | `--interval SECS` | Downsample interval in seconds (default: 60) |
+| `--workers N` | Process multiple downloaded POIs in parallel |
+| `--cache-dir DIR` | Cache downloaded images and HTTP validators |
+| `--influxdb-batch-size N` | Maximum points per direct InfluxDB write batch |
 | `--format influx\|csv` | Output format (default: influx line protocol) |
 
 ## How it works
